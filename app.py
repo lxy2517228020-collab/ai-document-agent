@@ -1,150 +1,63 @@
-import os
-import tempfile
-from datetime import datetime
-from pathlib import Path
+import copy
+import hashlib
+import html
+import json
+import re
 
 import streamlit as st
-from dotenv import load_dotenv
-from langchain_community.document_loaders import PyPDFLoader
-from langchain_community.vectorstores import FAISS
-from langchain_core.documents import Document
-from langchain_core.prompts import ChatPromptTemplate
-from langchain_google_genai import ChatGoogleGenerativeAI, GoogleGenerativeAIEmbeddings
-from langchain_text_splitters import RecursiveCharacterTextSplitter
+
+from agent import DocumentAgent
+from export_utils import history_to_markdown, history_to_txt
+from memory import (
+    FEEDBACK_LABELS,
+    add_task_history,
+    average_response_time,
+    clear_history,
+    init_session_state,
+    set_feedback,
+)
+from prompts import OUTPUT_DETAIL_SETTINGS, SCENARIO_PROMPTS
+from rag import (
+    DEFAULT_MODEL_MODE,
+    MODEL_MODES,
+    build_knowledge_base,
+    delete_document,
+    empty_knowledge_base,
+    fallback_model_message,
+    get_api_key,
+    get_embedding_model_name,
+    get_model_config,
+    get_model_name,
+    list_available_generation_models,
+    rebuild_knowledge_base,
+    uploaded_files_signature,
+)
 
 
-load_dotenv()
-
-DEFAULT_CHAT_MODEL = "gemini-3.5-flash"
-DEFAULT_EMBEDDING_MODEL = "gemini-embedding-2-preview"
-
-SCENARIO_PROMPTS = {
-    "课程资料复习": (
-        "你是一个课程复习助教。回答时要帮助学生抓住考点、概念关系和易错点。"
-        "如果适合，请用条目化方式说明，并给出可复习的重点。"
-    ),
-    "学术论文阅读": (
-        "你是一个学术论文阅读助手。回答时关注研究问题、方法、实验、结论、局限和贡献。"
-        "保持严谨，不要夸大论文没有明确支持的结论。"
-    ),
-    "企业制度问答": (
-        "你是一个企业制度问答助手。回答时要准确、稳健，优先引用制度原文。"
-        "如果上下文没有明确依据，请提醒用户需要查看原制度或咨询负责人。"
-    ),
-    "岗位 JD 分析": (
-        "你是一个岗位 JD 分析助手。回答时关注职责、能力要求、关键词、候选人匹配点和准备建议。"
-        "不要凭空补充 JD 中没有出现的硬性要求。"
-    ),
-}
-
-QUICK_ACTIONS = {
-    "总结全文": "请对知识库中的文档做一份结构化全文总结，包含核心主题、关键结论和适用场景。",
-    "提取关键词": "请提取 15 到 25 个关键词，并按主题分组。每个关键词后给一句简短解释。",
-    "生成知识点大纲": "请生成一份层级清晰的知识点大纲，适合快速复习或汇报。",
-    "生成 10 个复习问题": "请生成 10 个复习问题，并附上简短参考答案。",
-    "生成 FAQ": "请生成一份 FAQ，包含常见问题和清晰回答。",
-}
-
-
-def get_streamlit_secret(name: str) -> str | None:
-    """Read one value from Streamlit Secrets when running on Streamlit Cloud."""
-    try:
-        value = st.secrets.get(name)
-    except Exception:
-        return None
-
-    if value is None:
-        return None
-
-    return str(value)
-
-
-def get_config_value(name: str, default: str | None = None) -> str | None:
-    """Read configuration from Streamlit Secrets first, then environment variables."""
-    return get_streamlit_secret(name) or os.getenv(name) or default
-
-
-def get_api_key() -> str | None:
-    """Read the Gemini API key from Streamlit Secrets, environment, or local .env."""
-    api_key = get_config_value("GOOGLE_API_KEY")
-
-    if api_key:
-        # LangChain's Google integration also reads GOOGLE_API_KEY from os.environ.
-        os.environ["GOOGLE_API_KEY"] = api_key
-
-    return api_key
-
-
-def get_chat_model() -> ChatGoogleGenerativeAI:
-    """Create the Gemini chat model used to answer questions."""
-    get_api_key()
-    model_name = get_config_value("GEMINI_CHAT_MODEL", DEFAULT_CHAT_MODEL)
-    default_temperature = "1.0" if model_name.startswith("gemini-3") else "0.2"
-    temperature = float(get_config_value("GEMINI_TEMPERATURE", default_temperature))
-    return ChatGoogleGenerativeAI(model=model_name, temperature=temperature)
-
-
-def get_embeddings() -> GoogleGenerativeAIEmbeddings:
-    """Create the Gemini embedding model used by FAISS."""
-    get_api_key()
-    model_name = get_config_value("GEMINI_EMBEDDING_MODEL", DEFAULT_EMBEDDING_MODEL)
-    return GoogleGenerativeAIEmbeddings(model=model_name)
-
-
-def init_session_state() -> None:
-    """Initialize all Streamlit state used by the product prototype."""
-    defaults = {
-        "vector_store": None,
-        "chunks": [],
-        "documents": [],
-        "file_signature": None,
-        "file_records": [],
-        "stats": {
-            "files": 0,
-            "pages": 0,
-            "chunks": 0,
-            "questions": 0,
-            "helpful": 0,
-            "unhelpful": 0,
-        },
-        "chat_history": [],
-        "quick_outputs": {},
-    }
-
-    for key, value in defaults.items():
-        if key not in st.session_state:
-            st.session_state[key] = value
-
-
-def uploaded_files_signature(uploaded_files) -> tuple[tuple[str, int], ...]:
-    """Build a signature so Streamlit does not rebuild the index unnecessarily."""
-    return tuple((uploaded_file.name, uploaded_file.size) for uploaded_file in uploaded_files)
-
-
-def apply_product_styles() -> None:
-    """Add a restrained product-like layer over Streamlit defaults."""
+def apply_styles() -> None:
+    """Small product-style polish while keeping Streamlit simple."""
     st.markdown(
         """
         <style>
         .block-container {
-            padding-top: 2rem;
+            padding-top: 1.6rem;
             padding-bottom: 4rem;
-            max-width: 1280px;
+            max-width: 1320px;
         }
         [data-testid="stMetricValue"] {
-            font-size: 1.45rem;
+            font-size: 1.35rem;
         }
-        .kb-card {
+        .doc-card {
             border: 1px solid #e6e8eb;
             border-radius: 8px;
             padding: 0.8rem;
-            margin-bottom: 0.65rem;
             background: #ffffff;
+            margin-bottom: 0.7rem;
         }
-        .kb-meta {
+        .muted {
             color: #667085;
-            font-size: 0.82rem;
-            line-height: 1.45;
+            font-size: 0.88rem;
+            line-height: 1.5;
         }
         .source-card {
             border-left: 3px solid #4f46e5;
@@ -157,619 +70,796 @@ def apply_product_styles() -> None:
             font-size: 0.9rem;
             line-height: 1.55;
         }
+        .citation {
+            color: #2563eb;
+            font-size: 0.75em;
+            font-weight: 600;
+            cursor: pointer;
+            display: inline-block;
+            margin-left: 2px;
+            position: relative;
+            vertical-align: super;
+        }
+        .citation:hover {
+            color: #1d4ed8;
+            text-decoration: underline;
+        }
+        .citation:hover::after {
+            background: #111827;
+            border-radius: 6px;
+            bottom: 1.45em;
+            color: #ffffff;
+            content: attr(data-tooltip);
+            font-size: 0.78rem;
+            font-weight: 400;
+            left: 0;
+            line-height: 1.45;
+            max-width: 360px;
+            min-width: 240px;
+            padding: 0.45rem 0.55rem;
+            position: absolute;
+            text-align: left;
+            text-decoration: none;
+            white-space: normal;
+            z-index: 9999;
+        }
         </style>
         """,
         unsafe_allow_html=True,
     )
 
 
-def load_pdf_documents(uploaded_files) -> tuple[list[Document], list[dict]]:
-    """Save uploaded PDFs temporarily, then load their text page by page."""
-    documents: list[Document] = []
-    file_records: list[dict] = []
-    uploaded_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-    for uploaded_file in uploaded_files:
-        suffix = Path(uploaded_file.name).suffix or ".pdf"
-
-        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as temp_file:
-            temp_file.write(uploaded_file.getvalue())
-            temp_path = temp_file.name
-
-        try:
-            loader = PyPDFLoader(temp_path)
-            pages = loader.load()
-
-            for page in pages:
-                # Keep source metadata on every page so answers can cite it later.
-                page.metadata["source"] = uploaded_file.name
-                page.metadata["page"] = int(page.metadata.get("page", 0)) + 1
-                documents.append(page)
-
-            file_records.append(
-                {
-                    "name": uploaded_file.name,
-                    "size": uploaded_file.size,
-                    "pages": len(pages),
-                    "uploaded_at": uploaded_at,
-                    "status": "已建库",
-                }
-            )
-        except Exception:
-            file_records.append(
-                {
-                    "name": uploaded_file.name,
-                    "size": uploaded_file.size,
-                    "pages": 0,
-                    "uploaded_at": uploaded_at,
-                    "status": "建库失败",
-                }
-            )
-            raise
-        finally:
-            Path(temp_path).unlink(missing_ok=True)
-
-    return documents, file_records
-
-
-def split_documents(documents: list[Document]) -> list[Document]:
-    """Split PDF pages into chunks that are suitable for retrieval."""
-    splitter = RecursiveCharacterTextSplitter(
-        chunk_size=1000,
-        chunk_overlap=180,
-        separators=["\n\n", "\n", "。", "！", "？", ".", "!", "?", " ", ""],
-    )
-    return splitter.split_documents(documents)
-
-
-def build_vector_store(uploaded_files) -> tuple[FAISS, list[Document], list[Document], list[dict]]:
-    """Load PDFs, split text, embed chunks, and create a FAISS vector store."""
-    documents, file_records = load_pdf_documents(uploaded_files)
-    chunks = split_documents(documents)
-
-    if not chunks:
-        raise ValueError("没有从 PDF 中读取到可用文本。请确认 PDF 不是纯扫描图片。")
-
-    embeddings = get_embeddings()
-    vector_store = FAISS.from_documents(chunks, embeddings)
-
-    return vector_store, documents, chunks, file_records
-
-
-def format_context(docs: list[Document]) -> str:
-    """Format retrieved documents as source-aware context for the LLM."""
-    context_parts = []
-
-    for index, doc in enumerate(docs, start=1):
-        source = doc.metadata.get("source", "未知文件")
-        page = doc.metadata.get("page", "未知页码")
-        context_parts.append(
-            f"[片段 {index}] 来源：{source}，页码：{page}\n{doc.page_content}"
-        )
-
-    return "\n\n".join(context_parts)
-
-
-def extract_message_text(message) -> str:
-    """Return text from LangChain AIMessage across Gemini model response shapes."""
-    text_attr = getattr(message, "text", None)
-    if text_attr:
-        text = text_attr() if callable(text_attr) else text_attr
-        if text:
-            return text
-
-    content = getattr(message, "content", message)
-    if isinstance(content, str):
-        return content
-
-    if isinstance(content, list):
-        text_parts = []
-        for block in content:
-            if isinstance(block, dict) and block.get("type") == "text":
-                text_parts.append(block.get("text", ""))
-            elif isinstance(block, str):
-                text_parts.append(block)
-        return "\n".join(part for part in text_parts if part)
-
-    return str(content)
-
-
-def source_payload(docs: list[Document]) -> list[dict]:
-    """Convert retrieved documents to simple dictionaries for display and export."""
-    sources = []
-    seen = set()
-
-    for doc in docs:
-        snippet = " ".join(doc.page_content.split())[:500]
-        source = {
-            "file": doc.metadata.get("source", "未知文件"),
-            "page": doc.metadata.get("page", "未知页码"),
-            "snippet": snippet,
-        }
-        key = (source["file"], source["page"], source["snippet"][:120])
-
-        if key not in seen:
-            sources.append(source)
-            seen.add(key)
-
-    return sources
-
-
-def get_scenario_prompt(scenario: str) -> str:
-    """Return the system prompt for the selected use case."""
-    return SCENARIO_PROMPTS.get(scenario, SCENARIO_PROMPTS["课程资料复习"])
-
-
-def answer_question(
-    question: str,
-    vector_store: FAISS,
-    scenario: str,
-) -> tuple[str, list[Document]]:
-    """Retrieve relevant chunks and ask Gemini to answer with citations."""
-    retriever = vector_store.as_retriever(search_kwargs={"k": 5})
-    docs = retriever.invoke(question)
-
-    prompt = ChatPromptTemplate.from_messages(
-        [
-            (
-                "system",
-                "{scenario_prompt}\n\n"
-                "你也是一个严谨的 PDF 知识库问答助手。"
-                "请只根据提供的上下文回答问题；如果上下文没有答案，请明确说不知道。"
-                "回答必须展示引用来源，格式为：（来源：PDF 文件名，第 X 页）。"
-                "不要编造页码、文件名或上下文中没有的事实。",
-            ),
-            (
-                "human",
-                "问题：{question}\n\n"
-                "可参考的 PDF 原文片段：\n{context}\n\n"
-                "请用中文回答，并在关键结论后标注来源。",
-            ),
-        ]
-    )
-
-    llm = get_chat_model()
-    messages = prompt.format_messages(
-        scenario_prompt=get_scenario_prompt(scenario),
-        question=question,
-        context=format_context(docs),
-    )
-    response = llm.invoke(messages)
-
-    return extract_message_text(response), docs
-
-
-def corpus_preview(chunks: list[Document], limit: int = 14000) -> str:
-    """Create a compact corpus preview for document-level quick actions."""
-    parts = []
-    total_chars = 0
-
-    for chunk in chunks:
-        source = chunk.metadata.get("source", "未知文件")
-        page = chunk.metadata.get("page", "未知页码")
-        text = " ".join(chunk.page_content.split())
-        block = f"来源：{source}，页码：{page}\n{text}"
-
-        if total_chars + len(block) > limit:
-            break
-
-        parts.append(block)
-        total_chars += len(block)
-
-    return "\n\n".join(parts)
-
-
-def run_quick_action(action_name: str, scenario: str) -> str:
-    """Run a document-level analysis action against the current knowledge base."""
-    prompt = ChatPromptTemplate.from_messages(
-        [
-            (
-                "system",
-                "{scenario_prompt}\n\n"
-                "你正在为一个 AI 文档知识库生成可直接使用的分析结果。"
-                "请严格基于给定 PDF 片段输出；如果材料不足，请说明限制。"
-                "必要时引用来源，格式为：（来源：PDF 文件名，第 X 页）。",
-            ),
-            (
-                "human",
-                "任务：{task}\n\n"
-                "PDF 片段：\n{context}\n\n"
-                "请用中文输出，结构清晰，适合直接放入知识库产品界面。",
-            ),
-        ]
-    )
-    llm = get_chat_model()
-    messages = prompt.format_messages(
-        scenario_prompt=get_scenario_prompt(scenario),
-        task=QUICK_ACTIONS[action_name],
-        context=corpus_preview(st.session_state.chunks),
-    )
-    return extract_message_text(llm.invoke(messages))
-
-
-def set_feedback(message_index: int, value: str) -> None:
-    """Record one feedback vote per assistant answer and keep counters consistent."""
-    history = st.session_state.chat_history
-    previous = history[message_index].get("feedback")
-
-    if previous == value:
-        return
-
-    if previous == "helpful":
-        st.session_state.stats["helpful"] -= 1
-    elif previous == "unhelpful":
-        st.session_state.stats["unhelpful"] -= 1
-
-    history[message_index]["feedback"] = value
-
-    if value == "helpful":
-        st.session_state.stats["helpful"] += 1
-    else:
-        st.session_state.stats["unhelpful"] += 1
-
-
-def render_sources(sources: list[dict], expanded: bool = True) -> None:
-    """Display cited PDF snippets."""
-    if not sources:
-        return
-
-    with st.expander("引用来源", expanded=expanded):
-        for source in sources:
-            st.markdown(
-                f"""
-                <div class="source-card">
-                  <strong>{source["file"]}，第 {source["page"]} 页</strong>
-                  <div class="source-snippet">{source["snippet"]}</div>
-                </div>
-                """,
-                unsafe_allow_html=True,
-            )
-
-
-def render_feedback(message_index: int) -> None:
-    """Render helpful / unhelpful feedback buttons for one answer."""
-    current = st.session_state.chat_history[message_index].get("feedback")
-    col1, col2, col3 = st.columns([1, 1, 5])
-
-    with col1:
-        if st.button(
-            "有帮助",
-            key=f"helpful_{message_index}",
-            type="primary" if current == "helpful" else "secondary",
-        ):
-            set_feedback(message_index, "helpful")
-            st.rerun()
-
-    with col2:
-        if st.button(
-            "没帮助",
-            key=f"unhelpful_{message_index}",
-            type="primary" if current == "unhelpful" else "secondary",
-        ):
-            set_feedback(message_index, "unhelpful")
-            st.rerun()
-
-    with col3:
-        if current:
-            st.caption("已记录反馈")
-
-
-def markdown_export() -> str:
-    """Export chat history as Markdown."""
-    lines = ["# PDF 知识库问答记录", ""]
-    lines.append(f"导出时间：{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-    lines.append("")
-
-    for index, item in enumerate(st.session_state.chat_history, start=1):
-        lines.extend(
-            [
-                f"## 问答 {index}",
-                "",
-                f"**时间**：{item['created_at']}",
-                "",
-                f"**使用场景**：{item['scenario']}",
-                "",
-                f"**问题**：{item['question']}",
-                "",
-                "**回答**：",
-                "",
-                item["answer"],
-                "",
-                "**引用来源**：",
-            ]
-        )
-
-        for source in item["sources"]:
-            lines.append(f"- {source['file']}，第 {source['page']} 页：{source['snippet']}")
-
-        lines.extend(["", f"**反馈**：{item.get('feedback') or '未反馈'}", ""])
-
-    return "\n".join(lines)
-
-
-def txt_export() -> str:
-    """Export chat history as plain text."""
-    lines = ["PDF 知识库问答记录", f"导出时间：{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}", ""]
-
-    for index, item in enumerate(st.session_state.chat_history, start=1):
-        lines.extend(
-            [
-                f"问答 {index}",
-                f"时间：{item['created_at']}",
-                f"使用场景：{item['scenario']}",
-                f"问题：{item['question']}",
-                "回答：",
-                item["answer"],
-                "引用来源：",
-            ]
-        )
-
-        for source in item["sources"]:
-            lines.append(f"- {source['file']}，第 {source['page']} 页：{source['snippet']}")
-
-        lines.extend([f"反馈：{item.get('feedback') or '未反馈'}", "-" * 60, ""])
-
-    return "\n".join(lines)
-
-
-def render_sidebar(uploaded_files) -> None:
-    """Render API status, upload control, and knowledge base management."""
+def render_sidebar() -> None:
+    """Render API status, history, and metrics in the sidebar."""
     with st.sidebar:
-        st.subheader("知识库管理")
+        st.subheader("运行状态")
+        st.selectbox(
+            "模型模式",
+            options=list(MODEL_MODES.keys()),
+            key="model_mode",
+            help=(
+                "快速模式更适合演示；稳定模式默认推荐；高质量模式结果更完整，"
+                "但可能更慢、更容易触发限流。"
+            ),
+        )
+        st.selectbox(
+            "输出详细程度",
+            options=list(OUTPUT_DETAIL_SETTINGS.keys()),
+            key="detail_level",
+            help="用于平衡回答完整度和响应速度。简洁版更快，详细版更完整但耗时更长。",
+        )
+        st.caption("简洁版：适合快速演示，响应更快")
+        st.caption("标准版：内容更完整")
+        st.caption("详细版：适合深度分析，但响应更慢")
+        st.session_state.output_detail = st.session_state.detail_level
+        st.checkbox("启用快速路由", key="fast_routing")
+        st.checkbox("启用深度评估", key="deep_evaluation")
 
         if get_api_key():
             st.success("已读取 GOOGLE_API_KEY")
         else:
             st.error("未找到 GOOGLE_API_KEY")
-            st.info("请在环境变量或 .env 文件中配置 GOOGLE_API_KEY。")
+            st.info("本地使用 .env；Streamlit Cloud 使用 Secrets。")
 
-        st.caption(f"聊天模型：{get_config_value('GEMINI_CHAT_MODEL', DEFAULT_CHAT_MODEL)}")
-        st.caption(f"Embedding：{get_config_value('GEMINI_EMBEDDING_MODEL', DEFAULT_EMBEDDING_MODEL)}")
+        st.caption(f"当前模型：{get_model_name()}")
+        st.caption(f"当前模式：{st.session_state.model_mode}")
+        detail = OUTPUT_DETAIL_SETTINGS.get(st.session_state.detail_level, {})
+        st.caption(f"输出详细程度：{st.session_state.detail_level}（{detail.get('word_range', '-')}）")
+        st.caption(f"Embedding：{get_embedding_model_name()}")
+        st.caption(f"快速路由：{'开启' if st.session_state.fast_routing else '关闭'}")
+        st.caption(f"深度评估：{'开启' if st.session_state.deep_evaluation else '关闭'}")
+
+        with st.expander("模型调试", expanded=False):
+            model_config = get_model_config()
+            st.json(model_config)
+            if st.button("检测可用模型", use_container_width=True):
+                with st.spinner("正在调用 Gemini list_models..."):
+                    try:
+                        st.session_state.available_generation_models = list_available_generation_models()
+                    except Exception as exc:
+                        st.session_state.available_generation_models = []
+                        st.error(f"检测失败：{exc}")
+
+            if st.session_state.get("available_generation_models"):
+                st.write(st.session_state.available_generation_models)
+
+            st.checkbox("显示 citation debug", key="show_citation_debug")
 
         st.divider()
+        st.subheader("数据看板")
+        stats = st.session_state.stats
+        kb = st.session_state.knowledge_base
+        col1, col2 = st.columns(2)
+        col1.metric("总提问", stats["total_tasks"])
+        col2.metric("工具调用", stats["tool_calls"])
+        col1.metric("文档数", len(kb.get("file_records", [])))
+        col2.metric("文本块", len(kb.get("chunks", [])))
+        col1.metric("Gemini 调用", stats["gemini_calls"])
+        col2.metric("缓存命中", stats["cache_hits"])
+        col1.metric("Retry 次数", stats["retry_count"])
+        col2.metric("没帮助", stats["unhelpful"])
+        st.metric("平均响应时间", f"{average_response_time(stats):.2f}s")
 
-        if uploaded_files:
-            for record in st.session_state.file_records:
-                st.markdown(
-                    f"""
-                    <div class="kb-card">
-                      <strong>{record["name"]}</strong>
-                      <div class="kb-meta">
-                        页数：{record["pages"]}<br>
-                        上传：{record["uploaded_at"]}<br>
-                        状态：{record["status"]}
-                      </div>
-                    </div>
-                    """,
-                    unsafe_allow_html=True,
-                )
+        st.divider()
+        st.subheader("历史任务")
+        if not st.session_state.task_history:
+            st.caption("暂无历史任务。")
         else:
-            st.info("上传 PDF 后，这里会显示文件、页数、上传时间和建库状态。")
+            for item in reversed(st.session_state.task_history[-8:]):
+                st.caption(f"{item['created_at']} · {item['intent']}")
+                st.write(item["user_task"][:60])
+
+        if st.button("清空历史", use_container_width=True, disabled=not st.session_state.task_history):
+            clear_history(st)
+            st.rerun()
+
+
+def render_dashboard() -> None:
+    """Render top-level product metrics."""
+    stats = st.session_state.stats
+    kb = st.session_state.knowledge_base
+    cols = st.columns(6)
+    cols[0].metric("文档数量", len(kb.get("file_records", [])))
+    cols[1].metric("文本块数量", len(kb.get("chunks", [])))
+    cols[2].metric("任务次数", stats["total_tasks"])
+    cols[3].metric("工具调用", stats["tool_calls"])
+    cols[4].metric("Gemini 调用", stats["gemini_calls"])
+    cols[5].metric("缓存命中", stats["cache_hits"])
+
+
+def cache_key_for_task(user_task: str, scenario: str) -> str:
+    """Build a stable cache key for identical task + document + mode."""
+    payload = {
+        "task": user_task.strip(),
+        "scenario": scenario,
+        "file_signature": st.session_state.knowledge_base.get("file_signature"),
+        "model_mode": st.session_state.get("model_mode"),
+        "detail_level": st.session_state.get("detail_level"),
+        "fast_routing": st.session_state.get("fast_routing"),
+        "deep_evaluation": st.session_state.get("deep_evaluation"),
+    }
+    return hashlib.sha256(json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()
 
 
 def handle_upload(uploaded_files) -> None:
-    """Build or refresh the knowledge base when uploaded files change."""
+    """Build knowledge base automatically after upload."""
     if not uploaded_files:
         return
 
     current_signature = uploaded_files_signature(uploaded_files)
-    if current_signature == st.session_state.file_signature:
+    kb = st.session_state.knowledge_base
+    if current_signature == kb.get("file_signature"):
         return
 
     if not get_api_key():
-        st.warning("请先配置 GOOGLE_API_KEY，然后重新上传 PDF 或刷新页面。")
+        st.warning("请先配置 GOOGLE_API_KEY，再上传 PDF 建库。")
         return
 
-    pending_records = [
-        {
-            "name": uploaded_file.name,
-            "size": uploaded_file.size,
-            "pages": "-",
-            "uploaded_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            "status": "建库中",
-        }
-        for uploaded_file in uploaded_files
-    ]
-    st.session_state.file_records = pending_records
+    cache_key = repr(current_signature)
+    if cache_key in st.session_state.knowledge_base_cache:
+        st.session_state.knowledge_base = st.session_state.knowledge_base_cache[cache_key]
+        st.success("已复用缓存中的知识库和向量库，跳过重复 Embedding。")
+        return
 
-    with st.spinner("正在读取 PDF、切分文本、生成向量并建立 FAISS 知识库..."):
+    st.info("首次上传文档会较慢，因为需要解析 PDF、生成 Embedding 并建立向量库；后续提问会复用向量库。")
+
+    with st.spinner("正在解析 PDF、切分文本、生成 Gemini Embedding 并建立 FAISS 知识库..."):
         try:
-            vector_store, documents, chunks, file_records = build_vector_store(uploaded_files)
+            st.session_state.knowledge_base = build_knowledge_base(uploaded_files)
         except Exception as exc:
-            for record in st.session_state.file_records:
-                record["status"] = "建库失败"
-            st.session_state.vector_store = None
-            st.session_state.file_signature = None
-            st.error(f"知识库建立失败：{exc}")
-        else:
-            st.session_state.vector_store = vector_store
-            st.session_state.documents = documents
-            st.session_state.chunks = chunks
-            st.session_state.file_signature = current_signature
-            st.session_state.file_records = file_records
-            st.session_state.quick_outputs = {}
-            st.session_state.stats.update(
-                {
-                    "files": len(file_records),
-                    "pages": len(documents),
-                    "chunks": len(chunks),
-                }
+            st.error(
+                "知识库建立失败。若看到 503/429/timeout，可能是 Gemini 模型高峰期或免费额度繁忙；"
+                "请稍后重试，或切换到快速模式。"
             )
-            st.success("知识库已建立，可以开始提问或使用快捷分析。")
+            st.caption(str(exc))
+        else:
+            st.session_state.knowledge_base_cache[cache_key] = st.session_state.knowledge_base
+            st.success("知识库已建立。现在可以让 Agent 执行文档任务。")
 
 
-def render_dashboard() -> None:
-    """Render product metrics."""
-    stats = st.session_state.stats
+def render_knowledge_base_tab(uploaded_files) -> None:
+    """Render knowledge base management controls."""
+    st.subheader("知识库管理")
+    st.caption("单个 PDF 建议控制在 Streamlit 上传限制内。扫描版 PDF 需要先做 OCR，否则可能无法提取文本。")
+
+    handle_upload(uploaded_files)
+    kb = st.session_state.knowledge_base
+    records = kb.get("file_records", [])
+
+    if not records:
+        st.info("请先上传 PDF，系统会自动建立 FAISS 知识库。")
+        return
+
+    confirm_changes = st.checkbox("我确认要执行删除或清空知识库操作")
+
+    for record in records:
+        col_info, col_action = st.columns([4, 1])
+        with col_info:
+            st.markdown(
+                f"""
+                <div class="doc-card">
+                  <strong>{record["name"]}</strong>
+                  <div class="muted">
+                    页数：{record["pages"]} · 文本块：{record["chunks"]} · 大小：{record["size"]} bytes<br>
+                    上传时间：{record["uploaded_at"]} · 建库状态：{record["status"]}
+                  </div>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+        with col_action:
+            if st.button(
+                "删除",
+                key=f"delete_{record['name']}",
+                disabled=not confirm_changes,
+                use_container_width=True,
+            ):
+                st.session_state.knowledge_base = delete_document(kb, record["name"])
+                st.rerun()
+
+    col1, col2 = st.columns(2)
+    with col1:
+        if st.button("重新生成向量库", use_container_width=True):
+            with st.spinner("正在重新生成 FAISS 向量库..."):
+                st.session_state.knowledge_base = rebuild_knowledge_base(kb)
+            st.success("向量库已重新生成。")
+            st.rerun()
+    with col2:
+        if st.button("清空知识库", disabled=not confirm_changes, use_container_width=True):
+            st.session_state.knowledge_base = empty_knowledge_base()
+            st.success("知识库已清空。")
+            st.rerun()
+
+
+def compact_debug_value(value, max_chars: int = 500):
+    """Return a compact debug-safe representation."""
+    text = repr(value)
+    if len(text) <= max_chars:
+        return text
+    return f"{text[:max_chars]}..."
+
+
+def read_source_value(source, keys: list[str], metadata_keys: list[str] | None = None):
+    """Read one source value from dicts, objects, or LangChain Document metadata."""
+    metadata_keys = metadata_keys or keys
+
+    if isinstance(source, dict):
+        for key in keys:
+            value = source.get(key)
+            if value not in (None, ""):
+                return value
+
+        metadata = source.get("metadata")
+        if isinstance(metadata, dict):
+            for key in metadata_keys:
+                value = metadata.get(key)
+                if value not in (None, ""):
+                    return value
+
+    for key in keys:
+        value = getattr(source, key, None)
+        if value not in (None, ""):
+            return value
+
+    metadata = getattr(source, "metadata", None)
+    if isinstance(metadata, dict):
+        for key in metadata_keys:
+            value = metadata.get(key)
+            if value not in (None, ""):
+                return value
+
+    return None
+
+
+def normalize_source(source) -> dict:
+    """Normalize dicts and LangChain Document objects into the citation schema."""
+    if source is None:
+        return {}
+
+    file_name = read_source_value(
+        source,
+        ["file_name", "filename", "source", "doc_name", "file"],
+        metadata_keys=["file_name", "filename", "source", "doc_name", "file"],
+    )
+    page = read_source_value(
+        source,
+        ["page", "page_number", "page_num"],
+        metadata_keys=["page", "page_number", "page_num"],
+    )
+    snippet = read_source_value(
+        source,
+        ["snippet", "content", "text", "page_content"],
+        metadata_keys=["snippet", "content", "text", "page_content"],
+    )
+
+    return {
+        "file_name": str(file_name or "未知文件"),
+        "page": str(page if page not in (None, "") else "未知页码"),
+        "snippet": str(snippet or "暂无片段"),
+    }
+
+
+def normalize_sources(sources, dedupe: bool = False) -> list[dict]:
+    """Normalize sources while optionally deduping by file + page."""
+    normalized_sources = []
+    seen = set()
+    if not isinstance(sources, (list, tuple)):
+        sources = []
+
+    for source in sources:
+        normalized = normalize_source(source)
+        if not normalized:
+            continue
+
+        key = (normalized["file_name"], normalized["page"])
+        if dedupe and key in seen:
+            continue
+
+        normalized_sources.append(normalized)
+        seen.add(key)
+
+    return normalized_sources
+
+
+def truncate_snippet(text: str, max_chars: int = 140) -> str:
+    """Keep citation snippets readable in the UI."""
+    text = " ".join(str(text or "").split())
+    if len(text) <= max_chars:
+        return text
+    return f"{text[:max_chars].rstrip()}..."
+
+
+def citation_index_for_legacy(file_name: str, page: str, sources: list[dict]) -> int:
+    """Map old-style source text to the current source number."""
+    file_name = file_name.strip()
+    page = page.strip()
+    for index, source in enumerate(sources, start=1):
+        same_file = file_name in source["file_name"] or source["file_name"] in file_name
+        same_page = str(source["page"]) == page
+        if same_file and same_page:
+            return index
+    return 1 if sources else 0
+
+
+def replace_legacy_citations(answer: str, sources: list[dict]) -> str:
+    """Convert ugly inline source parentheses into compact numeric markers."""
+    pattern = re.compile(
+        r"[（(]\s*来源[:：]\s*([^，,）)]+)\s*[，,]\s*第?\s*([0-9]+)\s*页\s*[）)]"
+    )
+
+    def replace(match: re.Match) -> str:
+        index = citation_index_for_legacy(match.group(1), match.group(2), sources)
+        return f"[{index}]" if index else ""
+
+    return pattern.sub(replace, answer)
+
+
+def ensure_answer_has_citation(answer: str, sources: list[dict]) -> str:
+    """Add one compact citation when the model forgot all markers."""
+    if not sources or re.search(r"\[\d+(?:\s*,\s*\d+)*\]", answer) or "文档中未找到相关信息" in answer:
+        return answer
+
+    lines = answer.splitlines()
+    for index, line in enumerate(lines):
+        if line.strip() and not line.lstrip().startswith("#"):
+            lines[index] = f"{line.rstrip()} [1]"
+            return "\n".join(lines)
+
+    return f"{answer.rstrip()} [1]"
+
+
+def citation_sup_html(index: int, sources: list[dict]) -> str:
+    """Build one cited superscript with a source tooltip."""
+    if index < 1 or index > len(sources):
+        tooltip = html.escape("未找到对应来源", quote=True)
+        return f'<sup class="citation" title="{tooltip}" data-tooltip="{tooltip}">{index}</sup>'
+
+    source = sources[index - 1]
+    tooltip = (
+        f"文件：{source['file_name']}｜"
+        f"页码：第 {source['page']} 页｜"
+        f"片段：{truncate_snippet(source['snippet'], max_chars=120)}"
+    )
+    tooltip = html.escape(tooltip, quote=True)
+    return f'<sup class="citation" title="{tooltip}" data-tooltip="{tooltip}">{index}</sup>'
+
+
+def build_citation_debug(raw_sources, normalized_sources: list[dict], used_indexes: list[int]) -> dict:
+    """Build citation debug info for diagnosing source mapping."""
+    first_source = None
+    if isinstance(raw_sources, (list, tuple)) and raw_sources:
+        first_source = raw_sources[0]
+
+    mappings = []
+    for index in used_indexes:
+        source = normalized_sources[index - 1] if 1 <= index <= len(normalized_sources) else None
+        mappings.append(
+            {
+                "citation_number": index,
+                "source_index": index - 1,
+                "resolved": source or "未找到对应来源",
+            }
+        )
+
+    return {
+        "sources_type": type(raw_sources).__name__,
+        "sources_length": len(raw_sources) if isinstance(raw_sources, (list, tuple)) else 0,
+        "sources_0_structure": compact_debug_value(first_source) if first_source is not None else None,
+        "normalized_sources_length": len(normalized_sources),
+        "citation_mappings": mappings,
+    }
+
+
+def render_answer_with_citations(answer: str, sources: list[dict]) -> None:
+    """Render answer markdown and turn [1] / [1, 3] markers into tooltip superscripts."""
+    normalized_sources = normalize_sources(sources)
+    answer = replace_legacy_citations(answer, normalized_sources)
+    answer = ensure_answer_has_citation(answer, normalized_sources)
+    used_indexes = []
+
+    def replace_marker(match: re.Match) -> str:
+        raw_numbers = match.group(1)
+        superscripts = []
+
+        for raw_number in re.split(r"\s*,\s*", raw_numbers):
+            try:
+                index = int(raw_number)
+            except ValueError:
+                superscripts.append(f"[{raw_number}]")
+                continue
+
+            used_indexes.append(index)
+            superscripts.append(citation_sup_html(index, normalized_sources))
+
+        return "".join(superscripts)
+
+    html_answer = re.sub(r"\[(\d+(?:\s*,\s*\d+)*)\]", replace_marker, answer)
+    st.markdown(html_answer, unsafe_allow_html=True)
+
+    if st.session_state.get("show_citation_debug"):
+        with st.expander("Citation Debug", expanded=False):
+            st.json(build_citation_debug(sources, normalized_sources, used_indexes))
+
+
+def render_source_card(index: int, source: dict) -> None:
+    """Render one citation source card."""
+    st.markdown(
+        f"""
+        <div class="source-card">
+          <strong>来源 {index}</strong>
+          <div class="source-snippet">
+            <div>文件：{html.escape(str(source["file_name"]))}</div>
+            <div>页码：第 {html.escape(str(source["page"]))} 页</div>
+            <div>原文片段：{html.escape(truncate_snippet(source["snippet"]))}</div>
+          </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def render_sources(sources: list[dict], expanded: bool = True, answer_text: str = "") -> None:
+    """Render citation sources."""
+    normalized_sources = normalize_sources(sources, dedupe=True)
+
+    if not normalized_sources:
+        if "来源" in answer_text:
+            st.info("本次未返回结构化引用来源。")
+        return
+
+    visible_sources = normalized_sources[:5]
+    hidden_sources = normalized_sources[5:]
+
+    with st.expander("引用来源", expanded=expanded):
+        for index, source in enumerate(visible_sources, start=1):
+            render_source_card(index, source)
+
+    if hidden_sources:
+        with st.expander("查看更多引用来源", expanded=False):
+            for offset, source in enumerate(hidden_sources, start=6):
+                render_source_card(offset, source)
+
+
+def build_plain_text_result(record: dict) -> str:
+    """Build a copy-friendly plain text answer with citation sources."""
+    answer = str(record.get("answer", "")).strip()
+    sources = normalize_sources(record.get("sources", []), dedupe=True)
+    lines = ["Agent 回答正文", "", answer, "", "引用来源"]
+
+    if not sources:
+        lines.append("本次未返回结构化引用来源。")
+    else:
+        for index, source in enumerate(sources, start=1):
+            lines.extend(
+                [
+                    f"{index}. 文件：{source['file_name']}",
+                    f"   页码：第 {source['page']} 页",
+                    f"   原文片段：{truncate_snippet(source['snippet'], max_chars=180)}",
+                ]
+            )
+
+    return "\n".join(lines).strip()
+
+
+def build_markdown_result(record: dict) -> str:
+    """Build a Markdown export for one Agent result."""
+    answer = str(record.get("answer", "")).strip()
+    sources = normalize_sources(record.get("sources", []), dedupe=True)
+    lines = ["# Agent 执行结果", "", "## Agent 回答正文", "", answer, "", "## 引用来源"]
+
+    if not sources:
+        lines.append("本次未返回结构化引用来源。")
+    else:
+        for index, source in enumerate(sources, start=1):
+            lines.extend(
+                [
+                    f"### 来源 {index}",
+                    f"- 文件：{source['file_name']}",
+                    f"- 页码：第 {source['page']} 页",
+                    f"- 原文片段：{truncate_snippet(source['snippet'], max_chars=220)}",
+                    "",
+                ]
+            )
+
+    return "\n".join(lines).strip()
+
+
+def render_copy_export_area(record: dict, key_prefix: str) -> None:
+    """Render a copy-friendly plain text result and single-result downloads."""
+    plain_text_result = build_plain_text_result(record)
+    markdown_result = build_markdown_result(record)
+
+    with st.expander("复制纯文本结果", expanded=False):
+        st.text_area(
+            "纯文本结果",
+            value=plain_text_result,
+            height=240,
+            key=f"{key_prefix}_plain_text",
+            help="点击文本框后可以使用 Command + A / Command + C 复制，不需要选中页面正文。",
+        )
+        col_txt, col_md = st.columns(2)
+        with col_txt:
+            st.download_button(
+                label="下载 TXT",
+                data=plain_text_result,
+                file_name="agent_result.txt",
+                mime="text/plain",
+                use_container_width=True,
+                key=f"{key_prefix}_download_txt",
+            )
+        with col_md:
+            st.download_button(
+                label="下载 Markdown",
+                data=markdown_result,
+                file_name="agent_result.md",
+                mime="text/markdown",
+                use_container_width=True,
+                key=f"{key_prefix}_download_md",
+            )
+
+
+def render_agent_process(result: dict) -> None:
+    """Visualize router, plan, tool calls, and evaluation."""
+    with st.expander("Agent 执行过程", expanded=True):
+        st.markdown(f"**Intent**：`{result['router_result']['intent']}`")
+        st.json(result["router_result"])
+
+        st.markdown("**执行计划**")
+        for step in result["plan"]:
+            st.write(f"{step['step']}. {step['description']} · 工具：`{step['tool']}`")
+
+        st.markdown("**工具调用记录**")
+        if result["tool_calls"]:
+            for call in result["tool_calls"]:
+                st.write(f"{call['step']}. `{call['tool']}`")
+                st.caption(call.get("summary", ""))
+        else:
+            st.caption("本次没有调用工具。")
+
+        st.markdown("**可信度评估**")
+        st.json(result["evaluation"])
+        st.markdown("**模型使用情况**")
+        st.json(
+            {
+                "原始选择模型": result.get("selected_model"),
+                "实际使用模型": result.get("actual_model"),
+                "是否 fallback": result.get("model_fallback", False),
+                "fallback 模型": result.get("fallback_model"),
+                "fallback 原因": result.get("fallback_reason"),
+            }
+        )
+        if result.get("retry_events"):
+            st.markdown("**Retry 记录**")
+            st.json(result["retry_events"])
+        if result.get("errors"):
+            st.markdown("**失败原因**")
+            st.json(result["errors"])
+        st.caption(
+            f"响应时间：{result['response_time']} 秒 · "
+            f"Gemini 调用：{result.get('gemini_calls', 0)} · "
+            f"Retry：{result.get('retry_count', 0)} · "
+            f"缓存命中：{'是' if result.get('cache_hit') else '否'} · "
+            f"输出详细程度：{result.get('detail_level') or result.get('output_detail') or st.session_state.get('detail_level', '-')}"
+        )
+
+
+def render_feedback(record: dict) -> None:
+    """Render feedback buttons for one answer."""
+    current = record.get("feedback")
     cols = st.columns(6)
-    cols[0].metric("文件数", stats["files"])
-    cols[1].metric("文档页数", stats["pages"])
-    cols[2].metric("文本块", stats["chunks"])
-    cols[3].metric("提问次数", stats["questions"])
-    cols[4].metric("有帮助", stats["helpful"])
-    cols[5].metric("没帮助", stats["unhelpful"])
+
+    for index, (feedback_key, label) in enumerate(FEEDBACK_LABELS.items()):
+        with cols[index]:
+            if st.button(
+                label,
+                key=f"feedback_{record['id']}_{feedback_key}",
+                type="primary" if current == feedback_key else "secondary",
+                use_container_width=True,
+            ):
+                set_feedback(st, record["id"], feedback_key)
+                st.rerun()
 
 
-def render_chat_tab(scenario: str) -> None:
-    """Render chat history and handle new questions."""
-    st.subheader("知识库问答")
-
-    if not st.session_state.chat_history:
-        st.info("上传并建库后，在下方输入问题。回答会保留在当前会话历史中。")
-
-    for index, item in enumerate(st.session_state.chat_history):
-        with st.chat_message("user"):
-            st.write(item["question"])
-
-        with st.chat_message("assistant"):
-            st.markdown(item["answer"])
-            render_sources(item["sources"], expanded=False)
-            render_feedback(index)
-
-    question = st.chat_input("请输入你想问 PDF 的问题")
-
-    if not question:
-        return
-
-    if st.session_state.vector_store is None:
-        st.warning("请先上传 PDF 并等待知识库建立完成。")
-        return
-
+def render_result(record: dict, expanded_process: bool = False) -> None:
+    """Render one history item."""
     with st.chat_message("user"):
-        st.write(question)
+        st.write(record["user_task"])
 
     with st.chat_message("assistant"):
-        with st.spinner("正在检索相关内容并生成回答..."):
-            try:
-                answer, source_docs = answer_question(
-                    question=question,
-                    vector_store=st.session_state.vector_store,
-                    scenario=scenario,
-                )
-            except Exception as exc:
-                st.error(f"回答生成失败：{exc}")
-                return
+        render_answer_with_citations(record["answer"], record.get("sources", []))
+        metric_cols = st.columns(5)
+        metric_cols[0].metric("响应时间", f"{record.get('response_time', 0):.2f}s")
+        metric_cols[1].metric("Gemini 调用", record.get("gemini_calls", 0))
+        metric_cols[2].metric("Retry", record.get("retry_count", 0))
+        metric_cols[3].metric("缓存命中", "是" if record.get("cache_hit") else "否")
+        metric_cols[4].metric(
+            "输出详细程度",
+            record.get("detail_level") or record.get("output_detail") or st.session_state.detail_level,
+        )
+        model_cols = st.columns(3)
+        model_cols[0].metric("原始模型", record.get("selected_model") or "-")
+        model_cols[1].metric("实际模型", record.get("actual_model") or "-")
+        model_cols[2].metric("模型 Fallback", "是" if record.get("model_fallback") else "否")
+        if record.get("model_fallback"):
+            st.info(fallback_model_message())
+        if record.get("errors") or "当前 Gemini 模型繁忙" in record.get("answer", ""):
+            st.warning(
+                "Gemini 当前可能处于高峰期、免费额度繁忙或临时限流。"
+                "建议稍后重试、切换快速模式，或换用轻量 Flash 模型。"
+            )
+        render_sources(record.get("sources", []), expanded=False, answer_text=record.get("answer", ""))
+        render_copy_export_area(record, key_prefix=f"latest_{record['id']}")
+        if expanded_process:
+            render_agent_process(record)
+        else:
+            with st.expander("Agent 执行过程", expanded=False):
+                st.markdown(f"**Intent**：`{record['intent']}`")
+                for call in record.get("tool_calls", []):
+                    st.write(f"{call['step']}. `{call['tool']}`：{call.get('summary', '')}")
+        render_feedback(record)
 
-            sources = source_payload(source_docs)
-            st.markdown(answer)
-            render_sources(sources)
 
-    st.session_state.chat_history.append(
-        {
-            "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            "scenario": scenario,
-            "question": question,
-            "answer": answer,
-            "sources": sources,
-            "feedback": None,
-        }
+def render_agent_tab(scenario: str) -> None:
+    """Render the Agent task entry and latest result."""
+    st.subheader("让 Agent 帮你完成任务")
+    st.caption("可以输入普通问题，也可以输入任务型指令，例如：总结 PDF、生成 FAQ、对比两份文档、提取风险点、分析岗位 JD。")
+
+    user_task = st.text_area(
+        "自然语言任务",
+        placeholder="例如：帮我把这份论文整理成面试讲解稿，并生成 10 个复习问题",
+        height=110,
     )
-    st.session_state.stats["questions"] += 1
-    st.rerun()
+    run_clicked = st.button("运行 Agent", type="primary", use_container_width=True)
 
-
-def render_quick_actions_tab(scenario: str) -> None:
-    """Render document-level quick action buttons and results."""
-    st.subheader("文档智能处理")
-
-    if st.session_state.vector_store is None:
-        st.info("上传 PDF 并完成建库后，可在这里生成总结、关键词、大纲、复习题和 FAQ。")
-        return
-
-    cols = st.columns([1, 1, 1, 1, 1])
-    action_names = list(QUICK_ACTIONS.keys())
-
-    for index, action_name in enumerate(action_names):
-        with cols[index]:
-            if st.button(action_name, use_container_width=True):
-                with st.spinner(f"正在生成：{action_name}..."):
-                    try:
-                        st.session_state.quick_outputs[action_name] = run_quick_action(
-                            action_name,
+    if run_clicked:
+        if not user_task.strip():
+            st.warning("请输入一个任务。")
+        else:
+            with st.spinner("Agent 正在识别意图、规划步骤并调用工具..."):
+                try:
+                    task_key = cache_key_for_task(user_task, scenario)
+                    if task_key in st.session_state.agent_result_cache:
+                        result = copy.deepcopy(st.session_state.agent_result_cache[task_key])
+                        result["cache_hit"] = True
+                        result["response_time"] = 0.0
+                        result["gemini_calls"] = 0
+                        result["retry_count"] = 0
+                        result["retry_events"] = []
+                        result["errors"] = []
+                        result["model_fallback"] = False
+                    else:
+                        agent = DocumentAgent(
+                            st.session_state.knowledge_base,
                             scenario,
+                            fast_routing=st.session_state.fast_routing,
+                            deep_evaluation=st.session_state.deep_evaluation,
+                            detail_level=st.session_state.detail_level,
                         )
-                    except Exception as exc:
-                        st.error(f"{action_name} 生成失败：{exc}")
+                        result = agent.execute(user_task.strip(), st.session_state.last_agent_result)
+                        st.session_state.agent_result_cache[task_key] = copy.deepcopy(result)
+                except Exception as exc:
+                    st.error(
+                        "Agent 执行失败。若遇到 503 UNAVAILABLE、429 rate limit 或 timeout，"
+                        "可能是 Gemini 高峰期繁忙。请稍后重试，或切换到快速模式。"
+                    )
+                    st.caption(str(exc))
+                else:
+                    add_task_history(st, result)
+                    st.rerun()
 
-    for action_name, output in st.session_state.quick_outputs.items():
-        with st.expander(action_name, expanded=True):
-            st.markdown(output)
+    if st.session_state.last_agent_result:
+        st.divider()
+        st.subheader("最近一次执行结果")
+        render_result(st.session_state.last_agent_result, expanded_process=True)
+    else:
+        st.info("上传 PDF 后，在这里输入任务，Agent 会自动识别 intent、生成计划并调用工具。")
 
 
-def render_export_tab() -> None:
-    """Render conversation history and export controls."""
-    st.subheader("对话历史与导出")
+def render_history_tab() -> None:
+    """Render task history and export actions."""
+    st.subheader("历史记录与导出")
 
-    if not st.session_state.chat_history:
-        st.info("还没有问答记录。开始提问后，可以在这里导出 Markdown 或 TXT。")
+    if not st.session_state.task_history:
+        st.info("还没有历史任务。")
         return
-
-    for index, item in enumerate(st.session_state.chat_history, start=1):
-        with st.expander(f"{index}. {item['question']}", expanded=False):
-            st.caption(f"{item['created_at']} · {item['scenario']}")
-            st.markdown(item["answer"])
-            render_sources(item["sources"], expanded=False)
 
     col1, col2 = st.columns(2)
     with col1:
         st.download_button(
             "导出 Markdown",
-            data=markdown_export(),
-            file_name="pdf_qa_history.md",
+            data=history_to_markdown(st.session_state.task_history),
+            file_name="document_agent_history.md",
             mime="text/markdown",
             use_container_width=True,
         )
     with col2:
         st.download_button(
             "导出 TXT",
-            data=txt_export(),
-            file_name="pdf_qa_history.txt",
+            data=history_to_txt(st.session_state.task_history),
+            file_name="document_agent_history.txt",
             mime="text/plain",
             use_container_width=True,
         )
 
+    for record in reversed(st.session_state.task_history):
+        with st.expander(f"{record['created_at']} · {record['intent']} · {record['user_task'][:50]}", expanded=False):
+            render_answer_with_citations(record["answer"], record.get("sources", []))
+            render_sources(record.get("sources", []), expanded=False, answer_text=record.get("answer", ""))
+            render_copy_export_area(record, key_prefix=f"history_{record['id']}")
+            render_agent_process(record)
+
 
 def main() -> None:
-    st.set_page_config(page_title="AI 文档知识库", page_icon="📚", layout="wide")
-    init_session_state()
-    apply_product_styles()
+    st.set_page_config(page_title="AI Document Agent", page_icon="📚", layout="wide")
+    init_session_state(st)
+    apply_styles()
 
-    st.title("AI 文档知识库工作台")
-    st.caption("Gemini API + LangChain + FAISS + Streamlit")
+    st.title("AI Document Agent")
+    st.caption("Gemini API + LangChain + FAISS + Streamlit · 支持 RAG 检索、任务规划、工具调用和引用溯源")
+
+    render_sidebar()
 
     top_left, top_right = st.columns([2, 1])
-
     with top_left:
         uploaded_files = st.file_uploader(
             "上传 PDF 文档",
             type=["pdf"],
             accept_multiple_files=True,
-            help="支持一个或多个 PDF。上传后会自动读取文本、切分并建立 FAISS 向量知识库。",
+            help="支持一个或多个 PDF。上传完成后会自动建立 FAISS 知识库。",
         )
-
     with top_right:
-        scenario = st.selectbox(
-            "使用场景",
-            options=list(SCENARIO_PROMPTS.keys()),
-            help="不同场景会切换不同的 system prompt。",
-        )
+        scenario = st.selectbox("场景化模式", options=list(SCENARIO_PROMPTS.keys()))
 
-    handle_upload(uploaded_files)
-    render_sidebar(uploaded_files)
     render_dashboard()
-
     st.divider()
 
-    qa_tab, quick_tab, export_tab = st.tabs(["问答工作台", "快捷分析", "历史导出"])
-
-    with qa_tab:
-        render_chat_tab(scenario)
-
-    with quick_tab:
-        render_quick_actions_tab(scenario)
-
-    with export_tab:
-        render_export_tab()
+    agent_tab, kb_tab, history_tab = st.tabs(["Agent 工作台", "知识库管理", "历史与导出"])
+    with agent_tab:
+        render_agent_tab(scenario)
+    with kb_tab:
+        render_knowledge_base_tab(uploaded_files)
+    with history_tab:
+        render_history_tab()
 
 
 if __name__ == "__main__":
