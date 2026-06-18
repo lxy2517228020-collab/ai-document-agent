@@ -313,33 +313,6 @@ pypdf
 - 适配 Streamlit Community Cloud，可生成公网 HTTPS Demo
 - 针对 Gemini 503/429 等高峰期不稳定问题，加入 retry、缓存、模型切换和快速路由
 
-## 适合写进简历的项目描述
-
-产品经理简历描述：
-
-```text
-基于 Gemini API、LangChain、FAISS 和 Streamlit 搭建 AI Document Agent，支持 PDF 上传、RAG 检索、任务意图识别、工具调用、多步骤执行、引用溯源、智能摘要、FAQ/复习题生成、JD 分析和用户反馈闭环。
-```
-
-性能稳定性补充：
-
-```text
-针对大模型 API 高峰期不稳定问题，设计 retry、fallback、模型切换和缓存机制，提升 AI Agent Demo 的可用性与演示稳定性。
-```
-
-技术/数据方向简历描述：
-
-```text
-设计并实现 AI Document Agent 原型，将 PDF RAG 问答系统升级为多步骤文档任务执行器。项目使用 Gemini API 作为 LLM 与 Embedding 接口，基于 LangChain 封装检索和工具链，使用 FAISS 构建本地向量库，并通过 Streamlit 展示 intent 识别、任务规划、工具调用、中间结果、引用来源和反馈数据看板。
-```
-
-项目链接格式：
-
-```text
-在线演示：https://<your-app-name>.streamlit.app
-GitHub：https://github.com/<your-username>/<your-repo>
-```
-
 ## 后续优化方向
 
 - 使用 LangGraph 实现更标准的 Agent 状态机
